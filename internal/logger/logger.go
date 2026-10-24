@@ -116,9 +116,7 @@ func (w *rotateWriter) ensureOpenLocked() error {
 	if w.f != nil {
 		_ = w.f.Close()
 		w.f = nil
-		if w.compress {
-			_ = compressFile(w.pathLocked())
-		}
+		w.compressLocked(w.pathLocked())
 	}
 	if err := os.MkdirAll(w.dir, 0o755); err != nil {
 		return err
@@ -159,9 +157,7 @@ func (w *rotateWriter) rotateSizeLocked() error {
 	if err := os.Rename(src, rotated); err != nil {
 		return err
 	}
-	if w.compress {
-		_ = compressFile(rotated)
-	}
+	w.compressLocked(rotated)
 	// Buka file baru (masih dengan tanggal yang sama).
 	w.date = ""
 	return w.ensureOpenLocked()
@@ -199,26 +195,32 @@ func compressFile(src string) error {
 	if err != nil {
 		return err
 	}
-	defer in.Close()
 
 	// Tulis ke file sementara dulu supaya tidak ada .gz parsial yang tertinggal
 	// bila kompresi gagal di tengah jalan.
 	tmp := dst + ".tmp"
 	out, err := os.Create(tmp)
 	if err != nil {
+		_ = in.Close()
 		return err
 	}
 
 	gz := gzip.NewWriter(out)
 	_, copyErr := io.Copy(gz, in)
+
+	// File sumber WAJIB ditutup sebelum dihapus: di Windows file yang masih
+	// terbuka tidak bisa dihapus (ERROR_ACCESS_DENIED), sehingga .log asli
+	// tetap tertinggal walaupun isinya sudah ada di .gz (file dobel).
+	inCloseErr := in.Close()
+
 	// Tutup semua writer dulu agar seluruh data (termasuk footer gzip) tertulis
 	// sempurna sebelum file di-rename jadi .gz final.
 	gzCloseErr := gz.Close()
 	outCloseErr := out.Close()
 
-	if copyErr != nil || gzCloseErr != nil || outCloseErr != nil {
+	if copyErr != nil || inCloseErr != nil || gzCloseErr != nil || outCloseErr != nil {
 		_ = os.Remove(tmp) // buang .gz parsial; .log asli tetap utuh (tidak dobel)
-		return fmt.Errorf("compress %s: copy=%v gz=%v out=%v", src, copyErr, gzCloseErr, outCloseErr)
+		return fmt.Errorf("compress %s: copy=%v in=%v gz=%v out=%v", src, copyErr, inCloseErr, gzCloseErr, outCloseErr)
 	}
 
 	// Ganti .gz final, lalu hapus .log asli supaya tidak dobel (isinya sudah ada
@@ -227,7 +229,22 @@ func compressFile(src string) error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	return os.Remove(src)
+	if err := os.Remove(src); err != nil {
+		return fmt.Errorf("hapus %s setelah di-zip: %w", src, err)
+	}
+	return nil
+}
+
+// compressLocked mengompres file lama agar rotasi log tidak gagal diam-diam.
+// Kegagalan tidak menghentikan penulisan log, tapi tetap dilaporkan ke stderr
+// supaya cepat terdeteksi (kalau tidak, .log akan tertinggal tanpa .gz-nya).
+func (w *rotateWriter) compressLocked(path string) {
+	if !w.compress {
+		return
+	}
+	if err := compressFile(path); err != nil {
+		fmt.Fprintf(os.Stderr, "[logger] gagal compress %s: %v\n", path, err)
+	}
 }
 
 // Logger adalah pengganti logger winston.
