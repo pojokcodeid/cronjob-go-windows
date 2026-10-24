@@ -27,14 +27,18 @@ type Item struct {
 // GetAttendanceData adalah pengganti getAttendanceData() (database HKV).
 func GetAttendanceData(ctx context.Context, pool *sql.DB, log *logger.Logger) ([]Item, []any, error) {
 	const query = `
-		SELECT top 400 id,
-			FORMAT([DateTime], 'yyyy-MM-dd HH:mm') as DateTime,
-			FORMAT([DateTime], 'yyyy-MM-dd') as date,
-			FORMAT([DateTime], 'HH:mm') as time,
-			[Date], [Time], seq_id
-		FROM attendance
-		WHERE isnull(status, 0) = 0
-		ORDER BY [DateTime] asc`
+		SELECT TOP (400)
+       	   	   a.ID,
+       	   	   CONVERT(varchar(16), a.[DateTime], 120) AS [DateTime],
+       	   	   CONVERT(varchar(10), a.[DateTime], 120) AS [date],
+       	   	   CONVERT(varchar(5),  a.[DateTime], 108) AS [time],
+       	   	   a.[Date],
+       	   	   a.[Time],
+       	   	   a.seq_id
+		FROM attendance a
+		WHERE a.status = 0
+		ORDER BY a.[DateTime] ASC, a.seq_id ASC
+		`
 	rows, err := pool.QueryContext(ctx, query)
 	if err != nil {
 		log.Errorf("Error fetching attendance data: %v", err)
