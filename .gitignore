@@ -1,4 +1,5 @@
 .env
+.env_untukazure
 dist/
 *.exe
 logs/

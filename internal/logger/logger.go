@@ -193,25 +193,38 @@ func (w *rotateWriter) cleanupLocked() {
 }
 
 func compressFile(src string) error {
+	dst := src + ".gz"
+
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	out, err := os.Create(src + ".gz")
+
+	// Tulis ke file sementara dulu supaya tidak ada .gz parsial yang tertinggal
+	// bila kompresi gagal di tengah jalan.
+	tmp := dst + ".tmp"
+	out, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
+
 	gz := gzip.NewWriter(out)
-	if _, err := io.Copy(gz, in); err != nil {
-		out.Close()
-		return err
+	_, copyErr := io.Copy(gz, in)
+	// Tutup semua writer dulu agar seluruh data (termasuk footer gzip) tertulis
+	// sempurna sebelum file di-rename jadi .gz final.
+	gzCloseErr := gz.Close()
+	outCloseErr := out.Close()
+
+	if copyErr != nil || gzCloseErr != nil || outCloseErr != nil {
+		_ = os.Remove(tmp) // buang .gz parsial; .log asli tetap utuh (tidak dobel)
+		return fmt.Errorf("compress %s: copy=%v gz=%v out=%v", src, copyErr, gzCloseErr, outCloseErr)
 	}
-	if err := gz.Close(); err != nil {
-		out.Close()
-		return err
-	}
-	if err := out.Close(); err != nil {
+
+	// Ganti .gz final, lalu hapus .log asli supaya tidak dobel (isinya sudah ada
+	// di dalam zip).
+	if err := os.Rename(tmp, dst); err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
 	return os.Remove(src)

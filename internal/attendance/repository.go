@@ -26,11 +26,15 @@ type Item struct {
 
 // GetAttendanceData adalah pengganti getAttendanceData() (database HKV).
 func GetAttendanceData(ctx context.Context, pool *sql.DB, log *logger.Logger) ([]Item, []any, error) {
-	const query = "select top 400 id, FORMAT([DateTime],'yyyy-MM-dd HH:mm') as DateTime," +
-		"FORMAT([DateTime], 'yyyy-MM-dd') as date," +
-		"FORMAT([DateTime], 'HH:mm') as time," +
-		"[Date], [Time], seq_id  from  attendance where isnull(status,0) =0 order by [DateTime] asc"
-
+	const query = `
+		SELECT top 400 id,
+			FORMAT([DateTime], 'yyyy-MM-dd HH:mm') as DateTime,
+			FORMAT([DateTime], 'yyyy-MM-dd') as date,
+			FORMAT([DateTime], 'HH:mm') as time,
+			[Date], [Time], seq_id
+		FROM attendance
+		WHERE isnull(status, 0) = 0
+		ORDER BY [DateTime] asc`
 	rows, err := pool.QueryContext(ctx, query)
 	if err != nil {
 		log.Errorf("Error fetching attendance data: %v", err)
@@ -70,9 +74,19 @@ func GetAttendanceData(ctx context.Context, pool *sql.DB, log *logger.Logger) ([
 
 // GetAttendanceDataGD adalah pengganti getAttendanceDataGD() (database GD).
 func GetAttendanceDataGD(ctx context.Context, pool *sql.DB, log *logger.Logger) ([]Item, []any, error) {
-	const query = "select top 100 EMPNO,ATTENDDATA,DATE_FORMAT,FORMAT(TIME_FORMAT,'yyyy-MM-dd HH:mm') as TIME_FORMAT,FORMAT(TIME_FORMAT, 'HH:mm') as time," +
-		"FORMAT(TIME_FORMAT, 'yyyy-MM-dd') as date from THRMATTENDANCETEMP where MACHINENO ='ATTGO' " +
-		"and isnull(proc_sf7,0)=0 and TIME_FORMAT >= '2025-10-01' order by TIME_FORMAT asc"
+	const query = `
+		SELECT 
+			top 100 EMPNO,
+			ATTENDDATA,
+			DATE_FORMAT,
+			FORMAT(TIME_FORMAT,'yyyy-MM-dd HH:mm') as TIME_FORMAT,
+			FORMAT(TIME_FORMAT, 'HH:mm') as time,
+			FORMAT(TIME_FORMAT, 'yyyy-MM-dd') as date 
+		FROM THRMATTENDANCETEMP 
+		WHERE MACHINENO ='ATTGO'
+		AND isnull(proc_sf7,0)=0 
+		AND TIME_FORMAT >= '2025-10-01' 
+		ORDER BY TIME_FORMAT asc`
 
 	rows, err := pool.QueryContext(ctx, query)
 	if err != nil {
