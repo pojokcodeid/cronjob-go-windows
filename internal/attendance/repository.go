@@ -3,12 +3,27 @@ package attendance
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
+
+	mssql "github.com/microsoft/go-mssqldb"
 
 	"cron-job-azure/internal/logger"
+)
+
+const (
+	batchHKV = 400
+	batchGD  = 100
+
+	// Batas driver SQL Server: 2100 parameter per statement.
+	chunkHKV = 2000
+	chunkGD  = 1000
+
+	maxRetries = 3
+	baseDelay  = 500 * time.Millisecond
 )
 
 // Item adalah payload absen yang dikirim ke API,
@@ -24,21 +39,121 @@ type Item struct {
 	TempID      any    `json:"TEMP_ID"`
 }
 
+// ---------------------------------------------------------------------------
+// Helper: retry untuk error transient Azure SQL
+// ---------------------------------------------------------------------------
+
+func isTransient(err error) bool {
+	var sqlErr mssql.Error
+	if !errors.As(err, &sqlErr) {
+		return false
+	}
+	switch sqlErr.Number {
+	case 40613, 40501, 49918, 10928, 10929, 40197, 40540, 40143, 1205:
+		return true
+	}
+	return false
+}
+
+// withRetry mengulang fn hanya untuk error transient, dengan exponential backoff.
+// Aman dipakai untuk operasi idempoten (UPDATE ... AND status = 0).
+func withRetry(ctx context.Context, log *logger.Logger, op string, fn func() error) error {
+	var err error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if err = fn(); err == nil {
+			return nil
+		}
+		if !isTransient(err) || ctx.Err() != nil {
+			return err
+		}
+		delay := baseDelay << attempt
+		log.Errorf("%s: error transient (percobaan %d/%d), ulang dalam %v: %v",
+			op, attempt+1, maxRetries, delay, err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+	return err
+}
+
+// placeholders menghasilkan "@p1,@p2,...,@pN".
+func placeholders(n int) string {
+	var sb strings.Builder
+	sb.Grow(n * 6)
+	for i := 1; i <= n; i++ {
+		if i > 1 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString("@p")
+		sb.WriteString(strconv.Itoa(i))
+	}
+	return sb.String()
+}
+
+// execInChunks menjalankan: prefix + "(" + placeholders + ")" + suffix
+// per chunk. conv (opsional) mengubah tiap id menjadi argumen bertipe tepat.
+func execInChunks(
+	ctx context.Context,
+	pool *sql.DB,
+	log *logger.Logger,
+	op string,
+	ids []any,
+	size int,
+	prefix, suffix string,
+	conv func(any) any,
+) error {
+	for start := 0; start < len(ids); start += size {
+		end := min(start+size, len(ids)) // Go 1.21+
+		chunk := ids[start:end]
+
+		args := make([]any, len(chunk))
+		for i, id := range chunk {
+			if conv != nil {
+				args[i] = conv(id)
+			} else {
+				args[i] = id
+			}
+		}
+		query := prefix + "(" + placeholders(len(chunk)) + ")" + suffix
+
+		// var affected int64
+		err := withRetry(ctx, log, op, func() error {
+			_, err := pool.ExecContext(ctx, query, args...)
+			if err != nil {
+				return err
+			}
+			/* if n, e := res.RowsAffected(); e == nil {
+				affected = n
+			} */
+			return nil
+		})
+		if err != nil {
+			log.Errorf("%s: %v", op, err)
+			return err
+		}
+		/* 	if affected != int64(len(chunk)) {
+			log.Errorf("%s: diharapkan %d baris ter-update, hasil %d (kemungkinan sudah diproses sebelumnya)",
+				op, len(chunk), affected)
+		} */
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Database HKV
+// ---------------------------------------------------------------------------
+
 // GetAttendanceData adalah pengganti getAttendanceData() (database HKV).
+// Memerlukan filtered index IX_Attendance_Pending (lihat attendance_indexes.sql).
 func GetAttendanceData(ctx context.Context, pool *sql.DB, log *logger.Logger) ([]Item, []any, error) {
 	const query = `
-		SELECT TOP (400)
-       	   	   a.ID,
-       	   	   CONVERT(varchar(16), a.[DateTime], 120) AS [DateTime],
-       	   	   CONVERT(varchar(10), a.[DateTime], 120) AS [date],
-       	   	   CONVERT(varchar(5),  a.[DateTime], 108) AS [time],
-       	   	   a.[Date],
-       	   	   a.[Time],
-       	   	   a.seq_id
+		SELECT TOP (400) a.ID, a.[DateTime], a.seq_id
 		FROM attendance a
 		WHERE a.status = 0
-		ORDER BY a.[DateTime] ASC, a.seq_id ASC
-		`
+		ORDER BY a.[DateTime], a.seq_id`
+
 	rows, err := pool.QueryContext(ctx, query)
 	if err != nil {
 		log.Errorf("Error fetching attendance data: %v", err)
@@ -46,15 +161,13 @@ func GetAttendanceData(ctx context.Context, pool *sql.DB, log *logger.Logger) ([
 	}
 	defer rows.Close()
 
-	data := []Item{}
-	resultId := []any{}
+	data := make([]Item, 0, batchHKV)
+	resultID := make([]any, 0, batchHKV)
 	for rows.Next() {
-		var id any
-		var dateTime, date, timeStr string
-		var dateCol, timeCol any
-		var seqID any
-		if err := rows.Scan(&id, &dateTime, &date, &timeStr, &dateCol, &timeCol, &seqID); err != nil {
-			log.Errorf("Error fetching attendance data: %v", err)
+		var id, seqID any
+		var dt time.Time
+		if err := rows.Scan(&id, &dt, &seqID); err != nil {
+			log.Errorf("Error scanning attendance data: %v", err)
 			return nil, nil, err
 		}
 		data = append(data, Item{
@@ -62,50 +175,61 @@ func GetAttendanceData(ctx context.Context, pool *sql.DB, log *logger.Logger) ([
 			CompanyID:   35077,
 			EmployeeNo:  id,
 			InOutStatus: "0",
-			AttendHours: timeStr,
-			AttendDate:  date,
-			Datetime:    dateTime,
+			AttendHours: dt.Format("15:04"),
+			AttendDate:  dt.Format("2006-01-02"),
+			Datetime:    dt.Format("2006-01-02 15:04"),
 			TempID:      seqID,
 		})
-		resultId = append(resultId, seqID)
+		resultID = append(resultID, seqID)
 	}
 	if err := rows.Err(); err != nil {
-		log.Errorf("Error fetching attendance data: %v", err)
+		log.Errorf("Error iterating attendance data: %v", err)
 		return nil, nil, err
 	}
-	return data, resultId, nil
+	return data, resultID, nil
 }
+
+// UpdateAttendanceStatus adalah pengganti updateAttendanceStatus().
+// Parameterized, idempoten (AND status = 0), dengan retry error transient.
+func UpdateAttendanceStatus(ctx context.Context, pool *sql.DB, ids []any, log *logger.Logger) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	return execInChunks(ctx, pool, log, "UpdateAttendanceStatus", ids, chunkHKV,
+		"UPDATE attendance SET status = 1 WHERE seq_id IN ",
+		" AND status = 0",
+		nil,
+	)
+}
+
+// ---------------------------------------------------------------------------
+// Database GD
+// ---------------------------------------------------------------------------
 
 // GetAttendanceDataGD adalah pengganti getAttendanceDataGD() (database GD).
 func GetAttendanceDataGD(ctx context.Context, pool *sql.DB, log *logger.Logger) ([]Item, []any, error) {
 	const query = `
-		SELECT 
-			top 100 EMPNO,
-			ATTENDDATA,
-			DATE_FORMAT,
-			FORMAT(TIME_FORMAT,'yyyy-MM-dd HH:mm') as TIME_FORMAT,
-			FORMAT(TIME_FORMAT, 'HH:mm') as time,
-			FORMAT(TIME_FORMAT, 'yyyy-MM-dd') as date 
-		FROM THRMATTENDANCETEMP 
-		WHERE MACHINENO ='ATTGO'
-		AND isnull(proc_sf7,0)=0 
-		AND TIME_FORMAT >= '2025-10-01' 
-		ORDER BY TIME_FORMAT asc`
+		SELECT TOP (100) EMPNO, ATTENDDATA, TIME_FORMAT
+		FROM THRMATTENDANCETEMP
+		WHERE MACHINENO = 'ATTGO'
+		  AND ISNULL(proc_sf7, 0) = 0
+		  AND TIME_FORMAT >= '2025-10-01'
+		ORDER BY TIME_FORMAT ASC`
 
 	rows, err := pool.QueryContext(ctx, query)
 	if err != nil {
-		log.Errorf("Error fetching attendance data: %v", err)
+		log.Errorf("Error fetching attendance data GD: %v", err)
 		return nil, nil, err
 	}
 	defer rows.Close()
 
-	data := []Item{}
-	resultId := []any{}
+	data := make([]Item, 0, batchGD)
+	resultID := make([]any, 0, batchGD)
 	for rows.Next() {
-		var empNo, attendData, dateFormat any
-		var timeFormat, timeStr, date string
-		if err := rows.Scan(&empNo, &attendData, &dateFormat, &timeFormat, &timeStr, &date); err != nil {
-			log.Errorf("Error fetching attendance data: %v", err)
+		var empNo, attendData any
+		var tf time.Time
+		if err := rows.Scan(&empNo, &attendData, &tf); err != nil {
+			log.Errorf("Error scanning attendance data GD: %v", err)
 			return nil, nil, err
 		}
 		data = append(data, Item{
@@ -113,75 +237,33 @@ func GetAttendanceDataGD(ctx context.Context, pool *sql.DB, log *logger.Logger) 
 			CompanyID:   35077,
 			EmployeeNo:  empNo,
 			InOutStatus: "0",
-			AttendHours: timeStr,
-			AttendDate:  date,
-			Datetime:    timeFormat,
+			AttendHours: tf.Format("15:04"),
+			AttendDate:  tf.Format("2006-01-02"),
+			Datetime:    tf.Format("2006-01-02 15:04"),
 			TempID:      attendData,
 		})
-		resultId = append(resultId, attendData)
+		resultID = append(resultID, attendData)
 	}
 	if err := rows.Err(); err != nil {
-		log.Errorf("Error fetching attendance data: %v", err)
+		log.Errorf("Error iterating attendance data GD: %v", err)
 		return nil, nil, err
 	}
-	return data, resultId, nil
+	return data, resultID, nil
 }
 
-// formatIDs mengubah daftar id (dari response API / database) menjadi
-// potongan IN-clause, sejajar arraySecId.join(",") pada versi Node.js.
-func formatIDs(ids []any, quote bool) string {
-	parts := make([]string, 0, len(ids))
-	for _, id := range ids {
-		switch v := id.(type) {
-		case nil:
-			continue
-		case string:
-			s := strings.ReplaceAll(v, "'", "''")
-			if quote {
-				s = "'" + s + "'"
-			}
-			parts = append(parts, s)
-		case float64: // angka dari JSON response API
-			parts = append(parts, strconv.FormatInt(int64(v), 10))
-		case float32:
-			parts = append(parts, strconv.FormatInt(int64(v), 10))
-		case int64:
-			parts = append(parts, strconv.FormatInt(v, 10))
-		case int:
-			parts = append(parts, strconv.Itoa(v))
-		case json.Number:
-			parts = append(parts, v.String())
-		default:
-			parts = append(parts, fmt.Sprint(v))
-		}
-	}
-	return strings.Join(parts, ",")
-}
-
-// UpdateAttendanceStatus adalah pengganti updateAttendanceStatus()
-// (update attendance set status = 1 where seq_id in (...)).
-func UpdateAttendanceStatus(ctx context.Context, pool *sql.DB, ids []any, log *logger.Logger) error {
-	if len(ids) > 0 {
-		query := `update attendance set status = 1 where seq_id in (` + formatIDs(ids, false) + `)`
-		if _, err := pool.ExecContext(ctx, query); err != nil {
-			log.Errorf("Error updating attendance status: %v", err)
-			return err
-		}
-	}
-	return nil
-}
-
-// UpdateAttendanceStatusGD adalah pengganti updateAttendanceStatusGD()
-// (update THRMATTENDANCETEMP set proc_sf7 = 1 where ATTENDDATA in ('...')).
-// Sama seperti versi Node.js: dijalankan per nilai id.
+// UpdateAttendanceStatusGD adalah pengganti updateAttendanceStatusGD().
+// Satu statement per chunk (bukan satu UPDATE per id).
+//
+// mssql.VarChar dipakai agar parameter bertipe VARCHAR (sama dengan kolom),
+// sehingga tidak terjadi implicit conversion yang mematikan index.
+// Jika kolom ATTENDDATA bertipe NVARCHAR, ganti conv menjadi nil-return string biasa.
 func UpdateAttendanceStatusGD(ctx context.Context, pool *sql.DB, ids []any, log *logger.Logger) error {
-	for _, id := range ids {
-		query := `update THRMATTENDANCETEMP set proc_sf7 = 1 where ATTENDDATA in ('` +
-			strings.ReplaceAll(fmt.Sprint(id), "'", "''") + `')`
-		if _, err := pool.ExecContext(ctx, query); err != nil {
-			log.Errorf("Error updating attendance status: %v", err)
-			return err
-		}
+	if len(ids) == 0 {
+		return nil
 	}
-	return nil
+	return execInChunks(ctx, pool, log, "UpdateAttendanceStatusGD", ids, chunkGD,
+		"UPDATE THRMATTENDANCETEMP SET proc_sf7 = 1 WHERE ATTENDDATA IN ",
+		" AND ISNULL(proc_sf7, 0) = 0",
+		func(id any) any { return mssql.VarChar(fmt.Sprint(id)) },
+	)
 }
